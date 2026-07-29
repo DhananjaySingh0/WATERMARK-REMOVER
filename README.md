@@ -1,5 +1,4 @@
 ![image alt](https://github.com/DhananjaySingh0/WATERMARK-REMOVER/blob/86dc9daf3ad568cdd3402d0d0d0a9df4244f84aa/Screenshot.png)
-https://watermark-remover-sgvt.onrender.com
 
 # Watermark Remover
 
