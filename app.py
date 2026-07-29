@@ -1,0 +1,344 @@
+import os
+import time
+import uuid
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from flask import Flask, render_template, request, jsonify, send_file
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from watermark_remover import remove_watermark, FFMPEG
+from watermark_detector import detect_watermark
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['OUTPUT_FOLDER'] = 'outputs'
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
+
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
+
+jobs = {}
+ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'webm', 'flv'}
+
+# How long an error/finished job record stays in memory before being purged,
+# and how old a leftover /detect temp file has to be before the sweep
+# removes it (covers the case where a user detects a watermark but never
+# calls /upload, so the file would otherwise sit on disk forever).
+ERROR_JOB_TTL_SECONDS = 300
+STALE_DETECT_FILE_AGE_SECONDS = 3600
+STALE_SWEEP_INTERVAL_SECONDS = 1800
+
+# A finished job's output is now also streamed inline via /preview for the
+# "Complete" screen's video player, so it can no longer be deleted the
+# instant /download is hit (the preview may still be playing). Instead
+# outputs are left in place and swept up after this long, which is
+# generous enough to cover "watch the preview, then download".
+STALE_OUTPUT_FILE_AGE_SECONDS = 1800
+
+# Rate limiting — in-memory storage is fine for a single-process/single-
+# instance deployment. If this app is ever scaled to multiple worker
+# processes or machines, point storage_uri at a shared backend instead
+# (e.g. "redis://localhost:6379") so limits are enforced consistently.
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://",
+)
+
+# Watermark removal (especially 'inpaint') is CPU-heavy, so jobs run on a
+# bounded worker pool instead of one raw thread per request — otherwise
+# N simultaneous uploads would spawn N simultaneous inpainting jobs and
+# starve the machine. Extra jobs simply queue and wait for a free worker.
+MAX_CONCURRENT_JOBS = min(4, os.cpu_count() or 2)
+job_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS, thread_name_prefix='job-worker')
+
+# Minimal magic-byte signatures for the container formats we accept. This
+# catches the common case of a renamed/mislabeled file (e.g. a .txt saved
+# as "video.mp4") without pulling in python-magic, which depends on the
+# system libmagic library and is awkward to install on Windows.
+def sniff_video_signature(file_storage):
+    try:
+        head = file_storage.stream.read(64)
+    finally:
+        file_storage.stream.seek(0)
+    if len(head) < 12:
+        return False
+    if head[4:8] == b'ftyp':                          # MP4 / MOV (ISO base media)
+        return True
+    if head[0:4] == b'RIFF' and head[8:12] == b'AVI ':  # AVI
+        return True
+    if head[0:4] == b'\x1a\x45\xdf\xa3':                # MKV / WEBM (EBML header)
+        return True
+    if head[0:3] == b'FLV':                             # FLV
+        return True
+    return False
+
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def is_valid_uuid(value):
+    try:
+        uuid.UUID(value)
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def sweep_stale_detect_files():
+    """
+    Periodically remove /detect temp files that were never claimed by a
+    follow-up /upload call (e.g. the user closed the tab after detection),
+    and finished job outputs that have sat around longer than a user would
+    plausibly still be previewing/downloading them. Runs on a background
+    timer for the lifetime of the process.
+    """
+    try:
+        upload_dir = app.config['UPLOAD_FOLDER']
+        now = time.time()
+        for name in os.listdir(upload_dir):
+            if not name.startswith('detect_'):
+                continue
+            path = os.path.join(upload_dir, name)
+            try:
+                if now - os.path.getmtime(path) > STALE_DETECT_FILE_AGE_SECONDS:
+                    os.remove(path)
+            except OSError:
+                pass
+
+        output_dir = app.config['OUTPUT_FOLDER']
+        for name in os.listdir(output_dir):
+            if not name.endswith('_clean.mp4'):
+                continue
+            path = os.path.join(output_dir, name)
+            try:
+                if now - os.path.getmtime(path) > STALE_OUTPUT_FILE_AGE_SECONDS:
+                    os.remove(path)
+                    jobs.pop(name[:-len('_clean.mp4')], None)
+            except OSError:
+                pass
+    finally:
+        threading.Timer(STALE_SWEEP_INTERVAL_SECONDS, sweep_stale_detect_files).start()
+
+
+def safe_tmp_path(tmp_id, ext):
+    """
+    Validate that tmp_id is a real UUID (as generated by /detect) and that
+    ext is a known-safe extension, then build the reuse path. Returns None
+    if either value looks tampered with, instead of trusting client input
+    directly in a filesystem path (prevents path traversal).
+    """
+    try:
+        uuid.UUID(tmp_id)
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if ext not in ALLOWED_EXTENSIONS:
+        return None
+    path = os.path.join(app.config['UPLOAD_FOLDER'], f'detect_{tmp_id}.{ext}')
+    # Belt-and-suspenders: ensure the resolved path is still inside UPLOAD_FOLDER
+    upload_dir = os.path.abspath(app.config['UPLOAD_FOLDER'])
+    if not os.path.abspath(path).startswith(upload_dir + os.sep):
+        return None
+    return path
+
+
+def cleanup_job_files(*paths):
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+
+# Start the stale-temp-file sweep as soon as the module is loaded.
+threading.Timer(STALE_SWEEP_INTERVAL_SECONDS, sweep_stale_detect_files).start()
+
+
+@app.route('/')
+def index():
+    return render_template('index.html', ffmpeg_available=FFMPEG is not None)
+
+
+@app.route('/ffmpeg-status')
+def ffmpeg_status():
+    return jsonify({'available': FFMPEG is not None, 'path': FFMPEG})
+
+
+@app.route('/detect', methods=['POST'])
+@limiter.limit("20 per hour")
+def detect():
+    """Analyze uploaded video and return detected watermark regions."""
+    if 'video' not in request.files:
+        return jsonify({'error': 'No video'}), 400
+    file = request.files['video']
+    if not allowed_file(file.filename):
+        return jsonify({'error': 'Invalid file type'}), 400
+    if not sniff_video_signature(file):
+        return jsonify({'error': 'File content does not look like a valid video'}), 400
+
+    tmp_id = str(uuid.uuid4())
+    ext = file.filename.rsplit('.', 1)[1].lower()
+    tmp_path = os.path.join(app.config['UPLOAD_FOLDER'], f'detect_{tmp_id}.{ext}')
+    file.save(tmp_path)
+
+    try:
+        regions = detect_watermark(tmp_path, sample_frames=6)
+        # Store path so /upload can reuse it without re-uploading
+        return jsonify({'regions': regions, 'tmp_id': tmp_id, 'ext': ext})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        # Don't delete yet — /upload will reuse
+        pass
+
+
+@app.route('/upload', methods=['POST'])
+@limiter.limit("20 per hour")
+def upload_video():
+    try:
+        x = int(request.form.get('x', 0))
+        y = int(request.form.get('y', 0))
+        w = int(request.form.get('w', 0))
+        h = int(request.form.get('h', 0))
+        blur_strength = int(request.form.get('blur_strength', 25))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Invalid region or blur strength parameters'}), 400
+    method = request.form.get('method', 'inpaint')
+    if method not in ('inpaint', 'blur', 'pixelate', 'black', 'white'):
+        return jsonify({'error': 'Invalid method'}), 400
+    tmp_id = request.form.get('tmp_id', '')
+    ext = request.form.get('ext', '')
+
+    if w <= 0 or h <= 0:
+        return jsonify({'error': 'Invalid region — width and height must be > 0'}), 400
+
+    # Reuse already-uploaded file from /detect if available
+    if tmp_id and ext:
+        reuse_path = safe_tmp_path(tmp_id, ext)
+        if reuse_path is None:
+            return jsonify({'error': 'Invalid tmp_id or ext'}), 400
+        if os.path.exists(reuse_path):
+            job_id = str(uuid.uuid4())
+            input_path = reuse_path
+            output_path = os.path.join(app.config['OUTPUT_FOLDER'], f'{job_id}_clean.mp4')
+            jobs[job_id] = {'status': 'queued', 'progress': 0, 'error': None}
+            _start_job(job_id, input_path, output_path, (x, y, w, h), method, blur_strength, delete_input=True)
+            return jsonify({'job_id': job_id})
+
+    # Fresh upload
+    if 'video' not in request.files:
+        return jsonify({'error': 'No video file provided'}), 400
+    file = request.files['video']
+    if not allowed_file(file.filename):
+        return jsonify({'error': 'Invalid file type'}), 400
+    if not sniff_video_signature(file):
+        return jsonify({'error': 'File content does not look like a valid video'}), 400
+
+    job_id = str(uuid.uuid4())
+    fext = file.filename.rsplit('.', 1)[1].lower()
+    input_path = os.path.join(app.config['UPLOAD_FOLDER'], f'{job_id}.{fext}')
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], f'{job_id}_clean.mp4')
+    file.save(input_path)
+    jobs[job_id] = {'status': 'queued', 'progress': 0, 'error': None}
+    _start_job(job_id, input_path, output_path, (x, y, w, h), method, blur_strength, delete_input=True)
+    return jsonify({'job_id': job_id})
+
+
+def _start_job(job_id, input_path, output_path, region, method, blur_strength, delete_input=False):
+    def process():
+        jobs[job_id]['status'] = 'processing'
+        try:
+            remove_watermark(
+                input_path=input_path,
+                output_path=output_path,
+                region=region,
+                method=method,
+                blur_strength=blur_strength,
+                progress_callback=lambda p: jobs[job_id].update({'progress': p})
+            )
+            jobs[job_id]['status'] = 'done'
+            jobs[job_id]['progress'] = 100
+        except Exception as e:
+            jobs[job_id]['status'] = 'error'
+            jobs[job_id]['error'] = str(e)
+            # Errored jobs are never fetched via /download (which is what
+            # normally clears jobs[job_id]), so without this they would
+            # accumulate in memory for as long as the server runs.
+            threading.Timer(ERROR_JOB_TTL_SECONDS, lambda: jobs.pop(job_id, None)).start()
+        finally:
+            # The source video is no longer needed once processing has
+            # finished (success or failure) — remove it to avoid
+            # accumulating temp files in uploads/.
+            if delete_input:
+                cleanup_job_files(input_path)
+    # Submitting to a bounded pool (instead of threading.Thread per job)
+    # caps how many CPU-heavy inpainting jobs run at once; anything beyond
+    # MAX_CONCURRENT_JOBS waits in 'queued' state until a worker frees up.
+    job_executor.submit(process)
+
+
+@app.route('/status/<job_id>')
+@limiter.exempt
+def job_status(job_id):
+    if not is_valid_uuid(job_id):
+        return jsonify({'error': 'Invalid job id'}), 400
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    return jsonify(job)
+
+
+@app.route('/preview/<job_id>')
+@limiter.exempt
+def preview_result(job_id):
+    """
+    Stream the finished video inline (not as an attachment) so it can be
+    played in the <video> element on the 'Complete' screen. Supports range
+    requests (send_file's default conditional handling) since browsers
+    fetch video in chunks. Does NOT delete the file — /download and the
+    background sweep are responsible for cleanup, so a still-open preview
+    player can't have its file yanked out from under it mid-playback.
+    """
+    if not is_valid_uuid(job_id):
+        return jsonify({'error': 'Invalid job id'}), 400
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], f'{job_id}_clean.mp4')
+    if not os.path.exists(output_path):
+        return jsonify({'error': 'File not found'}), 404
+    return send_file(output_path, mimetype='video/mp4')
+
+
+@app.route('/download/<job_id>')
+def download_result(job_id):
+    if not is_valid_uuid(job_id):
+        return jsonify({'error': 'Invalid job id'}), 400
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], f'{job_id}_clean.mp4')
+    if not os.path.exists(output_path):
+        return jsonify({'error': 'File not found'}), 404
+    # The file is intentionally left in place after being sent — the user
+    # may still have the inline preview open on the same output, and video
+    # elements issue multiple range requests, so deleting it here (or
+    # shortly after) risks breaking playback or a re-download. The
+    # background sweep (STALE_OUTPUT_FILE_AGE_SECONDS) cleans it up later.
+    return send_file(output_path, as_attachment=True, download_name='watermark_removed.mp4')
+
+
+if __name__ == '__main__':
+    if FFMPEG:
+        print(f"✓ ffmpeg found: {FFMPEG}")
+    else:
+        print("⚠  ffmpeg NOT found — audio will not be preserved.")
+        print("   Install: winget install Gyan.FFmpeg")
+    # NOTE: debug=True enables Werkzeug's interactive debugger, which allows
+    # arbitrary code execution if this server is ever exposed beyond
+    # localhost. Keep this False unless you're actively debugging locally,
+    # and set FLASK_DEBUG=1 in your shell for a one-off debug run instead.
+    #
+    # Host/port: platforms like Render assign the port dynamically via the
+    # PORT env var and only scan 0.0.0.0 for an open port — binding to
+    # 127.0.0.1:5000 (the old default) is invisible to that scan. Locally,
+    # with no PORT set, this still falls back to 5000 on all interfaces.
+    port = int(os.environ.get('PORT', 5000))
+    app.run(debug=False, host='0.0.0.0', port=port)

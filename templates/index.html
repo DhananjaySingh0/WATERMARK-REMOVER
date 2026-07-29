@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Video Watermark Remover</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+  <div class="noise"></div>
+
+  
+  <header>
+    <div class="logo"><span class="logo-icon">◈</span><span>WATERMARK</span></div>
+    <div class="tagline">AI-Powered Watermark Removal</div>
+  </header>
+
+  <main>
+    <!-- STEP 1: Upload -->
+    <section id="step-upload" class="step active">
+      <div class="step-label"> Upload Video</div>
+      <div class="drop-zone" id="dropZone">
+        <div class="drop-icon">▶</div>
+        <p class="drop-title">Drop your video here</p>
+        <p class="drop-sub">MP4, AVI, MOV, MKV, WEBM — up to 500MB</p>
+        <button class="btn-outline" onclick="document.getElementById('fileInput').click()">Browse File</button>
+        <input type="file" id="fileInput" accept="video/*" hidden />
+      </div>
+    </section>
+
+    <!-- STEP 2: Analyzing -->
+    <section id="step-analyzing" class="step">
+      <div class="step-label"> Analyzing Video</div>
+      <div class="processing-card">
+        <div class="processing-animation">
+          <div class="proc-ring r1"></div>
+          <div class="proc-ring r2"></div>
+          <div class="proc-ring r3"></div>
+          <div class="proc-icon">⚡</div>
+        </div>
+        <p class="proc-title">Scanning for Watermarks...</p>
+        <p class="proc-sub">Analyzing frame consistency and logo patterns</p>
+        <div class="scan-steps">
+          <div class="scan-step" id="scan1"><span class="scan-dot"></span>Uploading video</div>
+          <div class="scan-step" id="scan2"><span class="scan-dot"></span>Sampling frames</div>
+          <div class="scan-step" id="scan3"><span class="scan-dot"></span>Detecting static overlays</div>
+          <div class="scan-step" id="scan4"><span class="scan-dot"></span>Finding logo regions</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- STEP 3: Select / Confirm Region -->
+    <section id="step-region" class="step">
+      <div class="step-label"> Confirm Watermark Region</div>
+      <div class="region-layout">
+        <div class="canvas-wrapper">
+          <video id="previewVideo" muted playsinline></video>
+          <canvas id="previewCanvas"></canvas>
+          <div id="selectionBox" class="selection-box hidden"></div>
+          <button id="playToggleBtn" class="play-toggle-btn" type="button" aria-label="Play preview">▶</button>
+          <div class="canvas-hint">Auto-detected regions shown • Click & drag to adjust manually</div>
+        </div>
+        <div class="controls-panel">
+
+          <!-- Auto-detected results -->
+          <div class="control-group" id="detectedGroup">
+            <label>Detected Regions <span id="detectedCount" class="badge">0</span></label>
+            <div id="detectedList" class="detected-list"></div>
+          </div>
+
+          <div class="control-group">
+            <label>Removal Method</label>
+            <div class="method-grid">
+              <label class="method-card active" data-value="inpaint">
+                <input type="radio" name="method" value="inpaint" checked hidden>
+                <span class="method-icon">✦</span><span>Smart Fill</span><small>Best quality</small>
+              </label>
+              <label class="method-card" data-value="blur">
+                <input type="radio" name="method" value="blur" hidden>
+                <span class="method-icon">◎</span><span>Blur</span><small>Fast</small>
+              </label>
+              <label class="method-card" data-value="pixelate">
+                <input type="radio" name="method" value="pixelate" hidden>
+                <span class="method-icon">▦</span><span>Pixelate</span><small>Artistic</small>
+              </label>
+              <label class="method-card" data-value="black">
+                <input type="radio" name="method" value="black" hidden>
+                <span class="method-icon">■</span><span>Black Box</span><small>Simple</small>
+              </label>
+            </div>
+          </div>
+
+          <div class="control-group hidden" id="blurControl">
+            <label>Effect Strength <span id="blurVal">25</span></label>
+            <input type="range" id="blurStrength" min="5" max="99" value="25" step="2" class="slider">
+          </div>
+
+          <div class="control-group">
+            <label>Selected Region</label>
+            <div class="region-info">
+              <div class="region-coord"><span>X</span><strong id="rX">—</strong></div>
+              <div class="region-coord"><span>Y</span><strong id="rY">—</strong></div>
+              <div class="region-coord"><span>W</span><strong id="rW">—</strong></div>
+              <div class="region-coord"><span>H</span><strong id="rH">—</strong></div>
+            </div>
+          </div>
+
+          <button class="btn-primary" id="processBtn" disabled>
+            <span>Remove Watermark</span><span class="btn-arrow">→</span>
+          </button>
+          <button class="btn-ghost" id="reuploadBtn">← Upload Different Video</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- STEP 4: Processing -->
+    <section id="step-processing" class="step">
+      <div class="step-label"> Processing</div>
+      <div class="processing-card">
+        <div class="processing-animation">
+          <div class="proc-ring r1"></div>
+          <div class="proc-ring r2"></div>
+          <div class="proc-ring r3"></div>
+          <div class="proc-icon">◈</div>
+        </div>
+        <p class="proc-title">Removing Watermark...</p>
+        <p class="proc-sub" id="procStatus">Analyzing frames</p>
+        <div class="progress-bar">
+          <div class="progress-fill" id="progressFill"></div>
+          <span class="progress-label" id="progressLabel">0%</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- STEP 5: Done -->
+    <section id="step-done" class="step">
+      <div class="step-label"> Complete</div>
+      <div class="done-card">
+        <div class="done-icon">✓</div>
+        <h2>Watermark Removed!</h2>
+        <p>Your video has been processed successfully.</p>
+        <div class="result-video-wrapper">
+          <video id="resultVideo" controls playsinline></video>
+        </div>
+        <div class="done-actions">
+          <a id="downloadBtn" class="btn-primary" href="#" download>
+            <span>Download Video</span><span class="btn-arrow">↓</span>
+          </a>
+          <button class="btn-ghost" id="startOverBtn">Process Another</button>
+        </div>
+      </div>
+    </section>
+
+    <div id="errorToast" class="error-toast hidden">
+      <span class="error-icon">!</span>
+      <span id="errorMsg">An error occurred.</span>
+      <button onclick="hideError()">×</button>
+    </div>
+  </main>
+
+  <footer>
+    <span> Video Watermark Remover</span>
+  </footer>
+
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
